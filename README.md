@@ -37,9 +37,11 @@ VS Code Copilot
 git clone https://github.com/awto-au/awto-mcp-serial
 cd awto-mcp-serial
 uv venv --python python3.14t .venv-ft
-source .venv-ft/bin/activate
-uv pip install -e .
+uv pip install -e . --python .venv-ft/bin/python
 ```
+
+> **Note:** This project uses a uv-managed venv — use `uv pip` not `pip` directly.
+> Activate with `source .venv-ft/bin/activate` for interactive use.
 
 ### Run the daemon
 
@@ -101,8 +103,7 @@ echo "status" | python ttu_cli.py query   # pipe from stdin
 ## Tests
 
 ```bash
-source .venv-ft/bin/activate
-python test_harness.py -v
+.venv-ft/bin/python test_harness.py -v
 ```
 
 26 tests across 5 layers — no hardware required (serial port is mocked).

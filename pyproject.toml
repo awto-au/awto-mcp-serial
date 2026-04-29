@@ -29,6 +29,15 @@ dependencies = [
 awto-serial-daemon = "serial_daemon:main"
 awto-ttu           = "ttu_cli:main"
 
+[tool.hatch.build.targets.wheel]
+sources = ["."]
+include = [
+    "mcp_server.py",
+    "serial_daemon.py",
+    "ttu_cli.py",
+    "protocol.py",
+]
+
 [dependency-groups]
 dev = []
 
