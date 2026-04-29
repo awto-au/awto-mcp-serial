@@ -46,7 +46,7 @@ uv pip install -e . --python .venv-ft/bin/python
 ### Run the daemon
 
 ```bash
-python serial_daemon.py --port /dev/ttyACM0 --baud 2480000 --eol lf
+.venv-ft/bin/python serial_daemon.py --port /dev/ttyACM0 --baud 2480000 --eol lf
 ```
 
 Options:
@@ -88,14 +88,14 @@ send "status" to the serial port
 ## CLI Tool (`ttu_cli.py`)
 
 ```bash
-python ttu_cli.py ping
-python ttu_cli.py info
-python ttu_cli.py query "status"
-python ttu_cli.py set-baud 2480000
-python ttu_cli.py set-eol crlf
-python ttu_cli.py detect-baud --probe "?"
-python ttu_cli.py detect-eol
-echo "status" | python ttu_cli.py query   # pipe from stdin
+.venv-ft/bin/python ttu_cli.py ping
+.venv-ft/bin/python ttu_cli.py info
+.venv-ft/bin/python ttu_cli.py query "status"
+.venv-ft/bin/python ttu_cli.py set-baud 2480000
+.venv-ft/bin/python ttu_cli.py set-eol crlf
+.venv-ft/bin/python ttu_cli.py detect-baud --probe "?"
+.venv-ft/bin/python ttu_cli.py detect-eol
+echo "status" | .venv-ft/bin/python ttu_cli.py query   # pipe from stdin
 ```
 
 ---
