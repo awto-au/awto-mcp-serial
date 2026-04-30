@@ -14,15 +14,16 @@ Requires the free-threaded (no-GIL) CPython build: python3.13t
 """
 
 import argparse
+import datetime
 import json
 import logging
 import logging.handlers
 import os
+import re
 import socket
 import sys
 import threading
 import time
-
 import serial
 
 from protocol import (
@@ -37,6 +38,9 @@ from protocol import (
 )
 
 log = logging.getLogger("daemon")
+
+_VALID_MAPS: frozenset[str] = frozenset({"INLCRNL", "ICRNL", "ONLCRNL", "ODELBS"})
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +94,12 @@ class SerialWorker:
         self._eol = eol
         self._ser: serial.Serial | None = None
         self._lock = threading.Lock()
+        self._maps: frozenset[str] = frozenset()
+        self._log_path: str | None = None
+        self._log_file = None
+        self._log_lock = threading.Lock()
+        self._log_strip = False
+        self._ts_format: str | None = None
 
     # ------------------------------------------------------------------
     @property
@@ -115,6 +125,7 @@ class SerialWorker:
         log.info("serial open: %s @ %d (eol=%s)", self._port, self._baud, self._eol)
 
     def close(self) -> None:
+        self.log_stop()
         if self._ser and self._ser.is_open:
             self._ser.close()
         self._ser = None
@@ -144,6 +155,10 @@ class SerialWorker:
             "baud": self._baud,
             "eol": self._eol,
             "is_open": is_open,
+            "maps": sorted(self._maps),
+            "log_path": self._log_path,
+            "log_strip": self._log_strip,
+            "ts_format": self._ts_format,
         }
 
     # ------------------------------------------------------------------
@@ -156,13 +171,25 @@ class SerialWorker:
         with self._lock:
             return self._query_locked(line, timeout_ms)
 
+    def query_with_timestamp(self, line: str, timeout_ms: int, ts_format: str | None) -> dict:
+        """Send query and optionally include a timestamp in the response payload."""
+        with self._lock:
+            response = self._query_locked(line, timeout_ms)
+            fmt = self._normalize_ts_format(ts_format) if ts_format is not None else self._ts_format
+            ts = self._format_ts_for(fmt)
+            out = {"response": response}
+            if ts:
+                out["timestamp"] = ts
+            return out
+
     def _query_locked(self, line: str, timeout_ms: int) -> str:
         if self._ser is None or not self._ser.is_open:
             raise IOError("serial port not open")
 
         terminator = EOL_BYTES[self._eol]
+        payload = self._apply_output_map(line.encode() + terminator)
         self._ser.reset_input_buffer()
-        self._ser.write(line.encode() + terminator)
+        self._ser.write(payload)
         self._ser.flush()
 
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -176,7 +203,9 @@ class SerialWorker:
                 if b"\n" in chunk or b"\r" in chunk:
                     break
 
-        return buf.decode(errors="replace").strip()
+        result = self._apply_input_map(bytes(buf)).decode(errors="replace").strip()
+        self._log_line(result)
+        return result
 
     # ------------------------------------------------------------------
     def detect_baud(
@@ -259,6 +288,113 @@ class SerialWorker:
             log.info("detect_eol: %s (sample=%r)", detected, data[:40])
             return detected
 
+    # ------------------------------------------------------------------
+    def set_map(self, maps_str: str) -> frozenset[str]:
+        """Set character mapping. maps_str is comma-separated names, or empty to clear."""
+        if not maps_str.strip():
+            with self._lock:
+                self._maps = frozenset()
+            return self._maps
+        names = frozenset(m.strip().upper() for m in maps_str.split(",") if m.strip())
+        invalid = names - _VALID_MAPS
+        if invalid:
+            raise ValueError(f"unknown maps: {sorted(invalid)}; valid: {sorted(_VALID_MAPS)}")
+        with self._lock:
+            self._maps = names
+        log.info("maps set: %s", sorted(names))
+        return names
+
+    def set_timestamp(self, fmt: str | None) -> None:
+        """Set timestamp format: 'iso8601', '24hour', 'epoch', or None/empty to disable."""
+        fmt = self._normalize_ts_format(fmt)
+        with self._lock:
+            self._ts_format = fmt
+        log.info("timestamp format: %s", self._ts_format)
+
+    def _normalize_ts_format(self, fmt: str | None) -> str | None:
+        if fmt in (None, ""):
+            return None
+        if fmt not in ("iso8601", "24hour", "epoch"):
+            raise ValueError("timestamp format must be iso8601, 24hour, epoch or empty")
+        return fmt
+
+    def log_start(self, path: str) -> None:
+        """Open log file in append mode. The file is never overwritten or deleted."""
+        with self._log_lock:
+            if self._log_file is not None:
+                self._log_file.flush()
+                self._log_file.close()
+            self._log_path = path
+            self._log_file = open(path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115
+            log.info("log started: %s", path)
+
+    def set_log_strip(self, enabled: bool) -> None:
+        """Enable or disable ANSI/control-character stripping for log writes."""
+        with self._log_lock:
+            self._log_strip = enabled
+        log.info("log strip: %s", enabled)
+
+    def log_stop(self) -> None:
+        """Flush and close the log file."""
+        with self._log_lock:
+            if self._log_file is not None:
+                self._log_file.flush()
+                self._log_file.close()
+                self._log_file = None
+                log.info("log stopped: %s", self._log_path)
+
+    def _apply_output_map(self, data: bytes) -> bytes:
+        maps = self._maps
+        if not maps:
+            return data
+        if "ONLCRNL" in maps:
+            data = data.replace(b"\n", b"\r\n")
+        if "ODELBS" in maps:
+            data = data.replace(b"\x7f", b"\x08")
+        return data
+
+    def _apply_input_map(self, data: bytes) -> bytes:
+        maps = self._maps
+        if not maps:
+            return data
+        if "ICRNL" in maps:
+            data = data.replace(b"\r", b"\n")
+        if "INLCRNL" in maps:
+            data = data.replace(b"\n", b"\r\n")
+        return data
+
+    def _format_ts(self) -> str:
+        return self._format_ts_for(self._ts_format)
+
+    def _format_ts_for(self, fmt: str | None) -> str:
+        if not fmt:
+            return ""
+        now = datetime.datetime.now()
+        if fmt == "epoch":
+            return f"{now.timestamp():.3f}"
+        elif fmt == "iso8601":
+            return now.isoformat(timespec="milliseconds")
+        else:  # 24hour
+            return now.strftime("%H:%M:%S.%f")[:12]
+
+    def _strip_for_log(self, text: str) -> str:
+        """Drop ANSI escapes and non-printable control chars except tab."""
+        text = _ANSI_RE.sub("", text)
+        return "".join(ch for ch in text if ch == "\t" or ch >= " " )
+
+    def _log_line(self, line: str) -> None:
+        """Write a received line to the log file (no-op if log not active)."""
+        with self._log_lock:
+            if self._log_file is not None:
+                try:
+                    payload = self._strip_for_log(line) if self._log_strip else line
+                    ts = self._format_ts()
+                    prefix = f"[{ts}] " if ts else ""
+                    self._log_file.write(prefix + payload + "\n")
+                    self._log_file.flush()
+                except OSError as exc:
+                    log.warning("log write failed: %s", exc)
+
     def ping(self) -> bool:
         if self._ser is None:
             return False
@@ -306,10 +442,16 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                 elif cmd == "query":
                     line_str = req.get("line", "")
                     timeout_ms = int(req.get("timeout_ms", 500))
+                    include_ts = bool(req.get("include_timestamp", False))
+                    ts_fmt = req.get("timestamp_format")
                     try:
-                        resp = worker.query(line_str, timeout_ms)
-                        _send(conn, make_ok(resp))
-                    except IOError as exc:
+                        if include_ts:
+                            out = worker.query_with_timestamp(line_str, timeout_ms, ts_fmt)
+                            _send(conn, {"ok": True, **out})
+                        else:
+                            resp = worker.query(line_str, timeout_ms)
+                            _send(conn, make_ok(resp))
+                    except (IOError, ValueError) as exc:
                         _send(conn, make_err(str(exc)))
 
                 elif cmd == "set_baud":
@@ -349,6 +491,37 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                 elif cmd == "info":
                     _send(conn, {"ok": True, "info": worker.info()})
 
+                elif cmd == "set_map":
+                    try:
+                        maps = worker.set_map(req.get("maps", ""))
+                        _send(conn, {"ok": True, "maps": sorted(maps)})
+                    except ValueError as exc:
+                        _send(conn, make_err(f"set_map: {exc}"))
+
+                elif cmd == "set_timestamp":
+                    try:
+                        worker.set_timestamp(req.get("format"))
+                        _send(conn, {"ok": True, "ts_format": worker._ts_format})
+                    except ValueError as exc:
+                        _send(conn, make_err(f"set_timestamp: {exc}"))
+
+                elif cmd == "log_start":
+                    path = req.get("path", "")
+                    strip = bool(req.get("strip", False))
+                    if not path:
+                        _send(conn, make_err("log_start: path required"))
+                    else:
+                        try:
+                            worker.set_log_strip(strip)
+                            worker.log_start(path)
+                            _send(conn, {"ok": True, "log_path": path, "log_strip": strip})
+                        except OSError as exc:
+                            _send(conn, make_err(f"log_start: {exc}"))
+
+                elif cmd == "log_stop":
+                    worker.log_stop()
+                    _send(conn, make_ok("log stopped"))
+
                 else:
                     _send(conn, make_err(f"unknown cmd: {cmd!r}"))
 
@@ -380,11 +553,26 @@ def main() -> None:
     ap.add_argument("--socket", default=DEFAULT_SOCKET_PATH, help="Unix socket path")
     ap.add_argument("--log-level", default="INFO",
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ap.add_argument("--map", default="", metavar="MAPS",
+                    help="comma-separated char maps: INLCRNL,ICRNL,ONLCRNL,ODELBS")
+    ap.add_argument("--log-file", default=None, metavar="PATH",
+                    help="log all RX data to this file (always appended, never deleted)")
+    ap.add_argument("--log-strip", action="store_true",
+                    help="strip ANSI/control chars before writing log lines")
+    ap.add_argument("--timestamp", default=None, choices=["iso8601", "24hour", "epoch"],
+                    help="prepend timestamp to log lines")
     args = ap.parse_args()
 
     _setup_logging("awto-serial-daemon", args.log_level)
 
     worker = SerialWorker(args.port, args.baud, eol=args.eol)
+    if args.map:
+        worker.set_map(args.map)
+    if args.log_file:
+        worker.set_log_strip(args.log_strip)
+        worker.log_start(args.log_file)
+    if args.timestamp:
+        worker.set_timestamp(args.timestamp)
     try:
         worker.open()
     except serial.SerialException as exc:

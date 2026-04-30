@@ -108,18 +108,44 @@ def _daemon_query(req: dict) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def serial_query(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str:
+def serial_query(
+    command: str,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    include_timestamp: bool = False,
+    timestamp_format: str = "",
+) -> str:
     """Send an ASCII command to the serial device and return its response.
 
     Args:
         command:    The ASCII command line to send (newline appended automatically).
         timeout_ms: How long to wait for the response in milliseconds (default 500).
+        include_timestamp: Include timestamp in output when enabled.
+        timestamp_format: Optional one-shot format: 'iso8601', '24hour', 'epoch'.
 
     Returns:
         The device's ASCII response, stripped of leading/trailing whitespace.
     """
     log.debug("serial_query: %r timeout=%dms", command, timeout_ms)
-    result = _daemon_query({"cmd": "query", "line": command, "timeout_ms": timeout_ms})
+    req = {
+        "cmd": "query",
+        "line": command,
+        "timeout_ms": timeout_ms,
+        "include_timestamp": include_timestamp,
+    }
+    if timestamp_format:
+        req["timestamp_format"] = timestamp_format
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, req)
+    except OSError as exc:
+        return f"error: {exc}"
+    if not resp.get("ok"):
+        return f"error: {resp.get('error', 'unknown')}"
+    result = resp.get("response", "")
+    ts = resp.get("timestamp")
+    if ts:
+        result = f"[{ts}] {result}"
     log.debug("serial_query response: %r", result[:120])
     return result
 
@@ -228,7 +254,7 @@ def serial_detect_eol(probe: str = "?", timeout_ms: int = 500) -> str:
 
 @mcp.tool()
 def serial_info() -> dict:
-    """Return current daemon state: port, baud, eol, is_open."""
+    """Return daemon state: port, baud, eol, maps, log_path, log_strip, ts_format, is_open."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.connect(_sock_path())
@@ -238,6 +264,76 @@ def serial_info() -> dict:
         return resp.get("info", {})
     except OSError as exc:
         return {"error": str(exc)}
+
+
+@mcp.tool()
+def serial_set_map(maps: str) -> str:
+    """Set character mapping (comma-separated). Valid names: INLCRNL, ICRNL, ONLCRNL, ODELBS.
+
+    Empty string clears all maps.
+    - ONLCRNL: outgoing NL → CRNL
+    - ODELBS:  outgoing DEL → BS
+    - ICRNL:   incoming CR → NL
+    - INLCRNL: incoming NL → CRNL
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "set_map", "maps": maps})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return f"ok (maps={resp.get('maps')})"
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def serial_set_timestamp(format: str = "") -> str:
+    """Set timestamp format prepended to log lines: 'iso8601', '24hour', 'epoch', or empty to disable."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "set_timestamp", "format": format})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return f"ok (ts_format={resp.get('ts_format')})"
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def serial_log_start(path: str, append: bool = True, strip: bool = False) -> str:
+    """Start logging all received serial data to a file.
+
+    The file is ALWAYS appended — it is never overwritten or deleted.
+    Args:
+        path: Absolute path to the log file.
+        append: Accepted for compatibility; ignored (always append-only).
+        strip: Strip ANSI/control chars before writing log lines.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "log_start", "path": path, "strip": strip})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return f"ok (logging to {resp.get('log_path')}, append-only, strip={resp.get('log_strip')})"
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def serial_log_stop() -> str:
+    """Stop logging received serial data (flushes and closes the log file)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "log_stop"})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return resp.get("response", "ok")
+    except OSError as exc:
+        return f"error: {exc}"
 
 
 # ---------------------------------------------------------------------------

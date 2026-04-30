@@ -86,6 +86,25 @@ def _call(req: dict) -> dict:
         sys.exit(1)
 
 
+def _print_response(resp: dict) -> None:
+    """Pretty-print the most useful field for each response type."""
+    if "response" in resp:
+        if "timestamp" in resp and resp["timestamp"]:
+            print(f"[{resp['timestamp']}] {resp['response']}")
+        else:
+            print(resp["response"])
+    elif "info" in resp:
+        info = resp["info"]
+        for k, v in info.items():
+            print(f"{k}: {v}")
+    elif "baud" in resp:
+        print(f"baud={resp['baud']}")
+    elif "eol" in resp:
+        print(f"eol={resp['eol']}")
+    else:
+        print(resp)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -106,6 +125,8 @@ def main() -> None:
     sp_query = sub.add_parser("query", help="send command, print response")
     sp_query.add_argument("text", nargs="?", default=None,
                           help="command text (or omit to read from stdin)")
+    sp_query.add_argument("--timestamp", choices=["iso8601", "24hour", "epoch"],
+                          help="include timestamp in the response")
 
     sub.add_parser("ping", help="health-check the daemon")
     sub.add_parser("info", help="show current port / baud / eol")
@@ -121,6 +142,23 @@ def main() -> None:
 
     sp_de = sub.add_parser("detect-eol", help="auto-detect line ending")
     sp_de.add_argument("--probe", default="?", help="probe string (default '?')")
+
+    sp_sm = sub.add_parser("set-map", help="set character mapping (tio -m style)")
+    sp_sm.add_argument("maps", help="comma-separated: INLCRNL,ICRNL,ONLCRNL,ODELBS (empty clears)")
+
+    sp_ls = sub.add_parser("log-start", help="start logging RX data to file (always appended)")
+    sp_ls.add_argument("path", help="log file path")
+    sp_ls.add_argument("--strip", action="store_true",
+                       help="strip ANSI/control chars before logging")
+    sp_ls.add_argument("--timestamp", choices=["iso8601", "24hour", "epoch"],
+                       help="also set timestamp format")
+
+    sub.add_parser("log-stop", help="stop logging RX data")
+
+    sp_ts = sub.add_parser("set-timestamp", help="set log timestamp format")
+    sp_ts.add_argument("format", nargs="?", default="",
+                       choices=["iso8601", "24hour", "epoch", ""],
+                       help="timestamp format (empty to disable)")
 
     # Back-compat: ``ttu_cli.py "status"`` with no subcommand → query
     args, leftover = ap.parse_known_args()
@@ -147,6 +185,19 @@ def main() -> None:
     elif args.subcmd == "detect-eol":
         resp = _call({"cmd": "detect_eol", "probe": args.probe,
                       "timeout_ms": args.timeout})
+    elif args.subcmd == "set-map":
+        resp = _call({"cmd": "set_map", "maps": args.maps})
+    elif args.subcmd == "log-start":
+        resp = _call({"cmd": "log_start", "path": args.path, "strip": args.strip})
+        if resp.get("ok") and getattr(args, "timestamp", None):
+            ts_resp = _call({"cmd": "set_timestamp", "format": args.timestamp})
+            if not ts_resp.get("ok"):
+                print(f"error: {ts_resp.get('error', 'unknown')}", file=sys.stderr)
+                sys.exit(1)
+    elif args.subcmd == "log-stop":
+        resp = _call({"cmd": "log_stop"})
+    elif args.subcmd == "set-timestamp":
+        resp = _call({"cmd": "set_timestamp", "format": args.format})
     elif args.subcmd == "query":
         text = args.text
         if text is None:
@@ -156,7 +207,11 @@ def main() -> None:
                 sys.exit(2)
             text = sys.stdin.read().strip()
         log.debug("query: %r timeout=%dms", text, args.timeout)
-        resp = _call({"cmd": "query", "line": text, "timeout_ms": args.timeout})
+        req = {"cmd": "query", "line": text, "timeout_ms": args.timeout}
+        if getattr(args, "timestamp", None):
+            req["include_timestamp"] = True
+            req["timestamp_format"] = args.timestamp
+        resp = _call(req)
     else:
         ap.print_help()
         sys.exit(2)
@@ -165,19 +220,7 @@ def main() -> None:
         print(f"error: {resp.get('error', 'unknown')}", file=sys.stderr)
         sys.exit(1)
 
-    # Pretty-print the most useful field for each response type
-    if "response" in resp:
-        print(resp["response"])
-    elif "info" in resp:
-        info = resp["info"]
-        for k, v in info.items():
-            print(f"{k}: {v}")
-    elif "baud" in resp:
-        print(f"baud={resp['baud']}")
-    elif "eol" in resp:
-        print(f"eol={resp['eol']}")
-    else:
-        print(resp)
+    _print_response(resp)
 
 
 if __name__ == "__main__":

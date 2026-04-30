@@ -89,6 +89,12 @@ def _make_worker_with_mock(responses: list[bytes]) -> SerialWorker:
     worker._baud = 2_000_000
     worker._eol = "lf"
     worker._lock = threading.Lock()
+    worker._maps = frozenset()
+    worker._log_path = None
+    worker._log_file = None
+    worker._log_lock = threading.Lock()
+    worker._ts_format = None
+    worker._log_strip = False
 
     mock_ser = MagicMock()
     mock_ser.is_open = True
@@ -310,6 +316,12 @@ class TestIntegration(unittest.TestCase):
         self._worker._baud = 2_000_000
         self._worker._eol = "lf"
         self._worker._lock = threading.Lock()
+        self._worker._maps = frozenset()
+        self._worker._log_path = None
+        self._worker._log_file = None
+        self._worker._log_lock = threading.Lock()
+        self._worker._ts_format = None
+        self._worker._log_strip = False
 
         mock_ser = MagicMock()
         mock_ser.is_open = True
@@ -414,6 +426,12 @@ class TestDetection(unittest.TestCase):
         worker._baud = 9600          # start wrong
         worker._eol = "lf"
         worker._lock = threading.Lock()
+        worker._maps = frozenset()
+        worker._log_path = None
+        worker._log_file = None
+        worker._log_lock = threading.Lock()
+        worker._ts_format = None
+        worker._log_strip = False
 
         mock_ser = MagicMock()
         mock_ser.is_open = True
@@ -474,6 +492,12 @@ class TestDetection(unittest.TestCase):
         worker._baud = 9600
         worker._eol = "lf"
         worker._lock = threading.Lock()
+        worker._maps = frozenset()
+        worker._log_path = None
+        worker._log_file = None
+        worker._log_lock = threading.Lock()
+        worker._ts_format = None
+        worker._log_strip = False
         mock_ser = MagicMock()
         mock_ser.is_open = True
         # always returns valid ASCII regardless of baud
@@ -517,6 +541,152 @@ class TestDetection(unittest.TestCase):
 # MCP client. The server in turn talks to the daemon over the Unix socket.
 # Optional: skipped automatically if 'mcp' is not installed.
 
+# ---------------------------------------------------------------------------
+# Layer 4b — TestMapLogTimestamp
+# ---------------------------------------------------------------------------
+
+class TestMapLogTimestamp(unittest.TestCase):
+
+    def _make_worker(self):
+        w = SerialWorker.__new__(SerialWorker)
+        w._port = "/dev/null"
+        w._baud = 115200
+        w._eol = "lf"
+        w._maps = frozenset()
+        w._log_path = None
+        w._log_file = None
+        w._log_lock = threading.Lock()
+        w._ts_format = None
+        w._log_strip = False
+        w._lock = threading.Lock()
+        w._ser = None
+        return w
+
+    def test_set_map_valid(self):
+        w = self._make_worker()
+        maps = w.set_map("ONLCRNL,ODELBS")
+        self.assertEqual(maps, frozenset({"ONLCRNL", "ODELBS"}))
+
+    def test_set_map_invalid_raises(self):
+        w = self._make_worker()
+        with self.assertRaises(ValueError):
+            w.set_map("BOGUS")
+
+    def test_set_map_clear(self):
+        w = self._make_worker()
+        w.set_map("ONLCRNL")
+        w.set_map("")
+        self.assertEqual(w._maps, frozenset())
+
+    def test_apply_output_onlcrnl(self):
+        w = self._make_worker()
+        w.set_map("ONLCRNL")
+        self.assertEqual(w._apply_output_map(b"hello\n"), b"hello\r\n")
+
+    def test_apply_output_odelbs(self):
+        w = self._make_worker()
+        w.set_map("ODELBS")
+        self.assertEqual(w._apply_output_map(b"a\x7f"), b"a\x08")
+
+    def test_apply_input_icrnl(self):
+        w = self._make_worker()
+        w.set_map("ICRNL")
+        self.assertEqual(w._apply_input_map(b"ok\r"), b"ok\n")
+
+    def test_set_timestamp_valid(self):
+        w = self._make_worker()
+        w.set_timestamp("iso8601")
+        self.assertEqual(w._ts_format, "iso8601")
+
+    def test_set_timestamp_invalid_raises(self):
+        w = self._make_worker()
+        with self.assertRaises(ValueError):
+            w.set_timestamp("bogus")
+
+    def test_set_timestamp_clear(self):
+        w = self._make_worker()
+        w.set_timestamp("epoch")
+        w.set_timestamp("")
+        self.assertIsNone(w._ts_format)
+
+    def test_format_ts_empty_when_disabled(self):
+        w = self._make_worker()
+        self.assertEqual(w._format_ts(), "")
+
+    def test_format_ts_epoch(self):
+        w = self._make_worker()
+        w.set_timestamp("epoch")
+        ts = w._format_ts()
+        self.assertRegex(ts, r"^\d+\.\d{3}$")
+        self.assertIn(".", ts)
+
+    def test_format_ts_iso8601(self):
+        w = self._make_worker()
+        w.set_timestamp("iso8601")
+        ts = w._format_ts()
+        self.assertFalse(ts.startswith("["))
+        self.assertIn("T", ts)
+
+    def test_log_start_appends_never_overwrites(self):
+        import tempfile, os
+        w = self._make_worker()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("existing\n")
+            path = f.name
+        try:
+            w.log_start(path)
+            w._log_line("new line")
+            w.log_stop()
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("existing", content)
+            self.assertIn("new line", content)
+        finally:
+            os.unlink(path)
+
+    def test_log_stop_noop_when_not_started(self):
+        w = self._make_worker()
+        w.log_stop()  # must not raise
+
+    def test_log_line_noop_when_not_started(self):
+        w = self._make_worker()
+        w._log_line("should not crash")  # must not raise
+
+    def test_log_includes_timestamp_when_set(self):
+        import tempfile, os
+        w = self._make_worker()
+        w.set_timestamp("epoch")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            path = f.name
+        try:
+            w.log_start(path)
+            w._log_line("hello")
+            w.log_stop()
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("[", content)
+            self.assertIn("hello", content)
+        finally:
+            os.unlink(path)
+
+    def test_log_strip_removes_ansi_sequences(self):
+        import tempfile, os
+        w = self._make_worker()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            path = f.name
+        try:
+            w.set_log_strip(True)
+            w.log_start(path)
+            w._log_line("\x1b[31mRED\x1b[0m")
+            w.log_stop()
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("RED", content)
+            self.assertNotIn("\x1b[31m", content)
+        finally:
+            os.unlink(path)
+
+
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -540,6 +710,12 @@ class TestMcpClientEndToEnd(unittest.TestCase):
         worker._baud = 2_480_000
         worker._eol = "lf"
         worker._lock = threading.Lock()
+        worker._maps = frozenset()
+        worker._log_path = None
+        worker._log_file = None
+        worker._log_lock = threading.Lock()
+        worker._ts_format = None
+        worker._log_strip = False
         mock_ser = MagicMock()
         mock_ser.is_open = True
         written: list[bytes] = []
