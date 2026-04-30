@@ -69,12 +69,15 @@ Options:
 | Tool | Arguments | Description |
 |------|-----------|-------------|
 | `serial_ping` | — | Check daemon is alive |
-| `serial_query` | `command`, `timeout_ms` | Send a command, read response |
+| `serial_query` | `command`, `timeout_ms`, `include_timestamp`, `timestamp_format` | Send a command, read response (optional timestamp) |
 | `serial_info` | — | Show port, baud, eol, is_open |
 | `serial_set_baud` | `baud` | Change baud rate live |
 | `serial_set_eol` | `eol` | Change line ending (`lf`/`cr`/`crlf`) |
 | `serial_detect_baud` | `probe`, `timeout_ms` | Auto-detect baud (fastest-first: 2480000→9600) |
 | `serial_detect_eol` | `probe`, `timeout_ms` | Auto-detect line ending |
+| `serial_set_timestamp` | `format` | Set timestamp format: `iso8601` / `24hour` / `epoch` |
+| `serial_log_start` | `path`, `strip` | Start append-only RX logging (optional ANSI/control stripping) |
+| `serial_log_stop` | — | Stop RX logging |
 
 Example Copilot prompts:
 ```
@@ -91,10 +94,14 @@ send "status" to the serial port
 .venv-ft/bin/python ttu_cli.py ping
 .venv-ft/bin/python ttu_cli.py info
 .venv-ft/bin/python ttu_cli.py query "status"
+.venv-ft/bin/python ttu_cli.py query "status" --timestamp epoch
 .venv-ft/bin/python ttu_cli.py set-baud 2480000
 .venv-ft/bin/python ttu_cli.py set-eol crlf
 .venv-ft/bin/python ttu_cli.py detect-baud --probe "?"
 .venv-ft/bin/python ttu_cli.py detect-eol
+.venv-ft/bin/python ttu_cli.py set-timestamp iso8601
+.venv-ft/bin/python ttu_cli.py log-start /tmp/awto-rx.log --strip --timestamp 24hour
+.venv-ft/bin/python ttu_cli.py log-stop
 echo "status" | .venv-ft/bin/python ttu_cli.py query   # pipe from stdin
 ```
 
@@ -106,7 +113,7 @@ echo "status" | .venv-ft/bin/python ttu_cli.py query   # pipe from stdin
 .venv-ft/bin/python test_harness.py -v
 ```
 
-26 tests across 5 layers — no hardware required (serial port is mocked).
+44 tests across 5 layers — no hardware required (serial port is mocked).
 
 ---
 

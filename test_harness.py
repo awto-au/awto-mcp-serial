@@ -361,6 +361,21 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["response"], "OK status")
 
+    def test_query_include_timestamp_epoch(self):
+        resp = _client_query(
+            self._tmp,
+            {
+                "cmd": "query",
+                "line": "status",
+                "timeout_ms": 200,
+                "include_timestamp": True,
+                "timestamp_format": "epoch",
+            },
+        )
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["response"], "OK status")
+        self.assertRegex(resp["timestamp"], r"^\d+\.\d{3}$")
+
     def test_unknown_cmd(self):
         resp = _client_query(self._tmp, {"cmd": "explode"})
         self.assertFalse(resp["ok"])
