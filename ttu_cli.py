@@ -319,6 +319,9 @@ def main() -> None:
                        choices=["iso8601", "24hour", "epoch", ""],
                        help="timestamp format (empty to disable)")
 
+    sp_se = sub.add_parser("set-echo", help="enable or disable local echo")
+    sp_se.add_argument("state", choices=["on", "off"])
+
     sub.add_parser("stats", help="show RX/TX byte counts and uptime")
 
     sp_hist = sub.add_parser("history", help="show received lines (newest first)")
@@ -398,6 +401,8 @@ def main() -> None:
         resp = _call({"cmd": "log_stop"})
     elif args.subcmd == "set-timestamp":
         resp = _call({"cmd": "set_timestamp", "format": args.format})
+    elif args.subcmd == "set-echo":
+        resp = _call({"cmd": "set_echo", "enabled": args.state == "on"})
     elif args.subcmd == "stats":
         resp = _call({"cmd": "stats"})
         if resp.get("ok"):

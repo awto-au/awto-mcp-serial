@@ -106,6 +106,7 @@ def _make_worker_with_mock(responses: list[bytes]) -> SerialWorker:
     worker._rx_stop = threading.Event()
     worker._reconnecting = False
     worker._reconnect_lock = threading.Lock()
+    worker._echo = False
 
     mock_ser = MagicMock()
     mock_ser.is_open = True
@@ -252,6 +253,12 @@ class TestSerialWorker(unittest.TestCase):
         worker = self._worker(b"OK\n")
         self.assertEqual(worker.query_hex("status", 100), "4f 4b 0a")
 
+    def test_query_full_local_echo_prefixes_command(self):
+        worker = self._worker(b"OK 42\n")
+        worker.set_echo(True)
+        out = worker.query_full("status", 100)
+        self.assertEqual(out["response"], "status\nOK 42")
+
     def test_concurrent_queries_serialised(self):
         """Multiple threads calling query() must not interleave."""
         N = 20
@@ -370,6 +377,7 @@ class TestIntegration(unittest.TestCase):
         self._worker._rx_stop = threading.Event()
         self._worker._reconnecting = False
         self._worker._reconnect_lock = threading.Lock()
+        self._worker._echo = False
 
         mock_ser = MagicMock()
         mock_ser.is_open = True
@@ -431,6 +439,24 @@ class TestIntegration(unittest.TestCase):
         )
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["response"], "4f 4b 20 73 74 61 74 75 73 0a")
+
+    def test_set_echo_and_query_text(self):
+        resp = _client_query(self._tmp, {"cmd": "set_echo", "enabled": True})
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp["echo"])
+        resp = _client_query(self._tmp, {"cmd": "query", "line": "status", "timeout_ms": 200})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["response"], "status\nOK status")
+
+    def test_set_echo_and_query_hex(self):
+        resp = _client_query(self._tmp, {"cmd": "set_echo", "enabled": True})
+        self.assertTrue(resp["ok"])
+        resp = _client_query(
+            self._tmp,
+            {"cmd": "query", "line": "status", "timeout_ms": 200, "output_mode": "hex"},
+        )
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["response"], "73 74 61 74 75 73\n4f 4b 20 73 74 61 74 75 73 0a")
 
     def test_unknown_cmd(self):
         resp = _client_query(self._tmp, {"cmd": "explode"})
@@ -537,6 +563,7 @@ class TestDetection(unittest.TestCase):
         worker._rx_stop = threading.Event()
         worker._reconnecting = False
         worker._reconnect_lock = threading.Lock()
+        worker._echo = False
 
         mock_ser = MagicMock()
         mock_ser.is_open = True
@@ -614,6 +641,7 @@ class TestDetection(unittest.TestCase):
         worker._rx_stop = threading.Event()
         worker._reconnecting = False
         worker._reconnect_lock = threading.Lock()
+        worker._echo = False
         mock_ser = MagicMock()
         mock_ser.is_open = True
         # always returns valid ASCII regardless of baud
@@ -687,6 +715,7 @@ class TestMapLogTimestamp(unittest.TestCase):
         w._rx_stop = threading.Event()
         w._reconnecting = False
         w._reconnect_lock = threading.Lock()
+        w._echo = False
         return w
 
     def test_set_map_valid(self):
@@ -854,6 +883,7 @@ class TestMcpClientEndToEnd(unittest.TestCase):
         worker._rx_stop = threading.Event()
         worker._reconnecting = False
         worker._reconnect_lock = threading.Lock()
+        worker._echo = False
         mock_ser = MagicMock()
         mock_ser.is_open = True
         written: list[bytes] = []

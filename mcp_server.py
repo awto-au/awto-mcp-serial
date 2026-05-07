@@ -309,6 +309,20 @@ def serial_set_timestamp(format: str = "") -> str:
 
 
 @mcp.tool()
+def serial_set_echo(enabled: bool = False) -> str:
+    """Enable or disable local echo so transmitted commands are included in responses."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "set_echo", "enabled": enabled})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return f"ok (echo={resp.get('echo')})"
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
 def serial_log_start(path: str, append: bool = True, strip: bool = False) -> str:
     """Start logging all received serial data to a file.
 

@@ -103,6 +103,7 @@ class SerialWorker:
         self._log_lock = threading.Lock()
         self._log_strip = False
         self._ts_format: str | None = None
+        self._echo = False
 
         # RX/TX statistics
         self._rx_bytes = 0
@@ -176,6 +177,7 @@ class SerialWorker:
             "port": self._port,
             "baud": self._baud,
             "eol": self._eol,
+            "echo": self._echo,
             "is_open": is_open,
             "maps": sorted(self._maps),
             "log_path": self._log_path,
@@ -204,7 +206,11 @@ class SerialWorker:
         """Like query_hex() but includes warning when bytes are unterminated."""
         with self._lock:
             raw, terminated = self._query_locked(line, timeout_ms)
-            out: dict = {"response": " ".join(f"{b:02x}" for b in raw)}
+            hex_resp = " ".join(f"{b:02x}" for b in raw)
+            if self._echo:
+                prefix = " ".join(f"{b:02x}" for b in self._apply_output_map(line.encode()))
+                hex_resp = f"{prefix}\n{hex_resp}" if hex_resp else prefix
+            out: dict = {"response": hex_resp}
             if not terminated and raw:
                 out["warning"] = (
                     "unterminated response: data received but no EOL (CR/LF) "
@@ -222,6 +228,7 @@ class SerialWorker:
         with self._lock:
             raw, terminated = self._query_locked(line, timeout_ms)
             result = self._decode_response(raw)
+            result = self._echo_response(line, result)
             out: dict = {"response": result}
             if not terminated and result:
                 out["warning"] = (
@@ -236,6 +243,7 @@ class SerialWorker:
         with self._lock:
             raw, terminated = self._query_locked(line, timeout_ms)
             result = self._decode_response(raw)
+            result = self._echo_response(line, result)
             fmt = self._normalize_ts_format(ts_format) if ts_format is not None else self._ts_format
             ts = self._format_ts_for(fmt)
             out: dict = {"response": result}
@@ -288,6 +296,13 @@ class SerialWorker:
         result = self._apply_input_map(data).decode(errors="replace").strip()
         self._log_line(result)
         return result
+
+    def _echo_response(self, line: str, response: str) -> str:
+        if not self._echo:
+            return response
+        if response:
+            return f"{line}\n{response}"
+        return line
 
     # ------------------------------------------------------------------
     def detect_baud(
@@ -393,6 +408,11 @@ class SerialWorker:
         with self._lock:
             self._ts_format = fmt
         log.info("timestamp format: %s", self._ts_format)
+
+    def set_echo(self, enabled: bool) -> None:
+        with self._lock:
+            self._echo = enabled
+        log.info("local echo: %s", enabled)
 
     def _normalize_ts_format(self, fmt: str | None) -> str | None:
         if fmt in (None, ""):
@@ -812,6 +832,10 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                     except ValueError as exc:
                         _send(conn, make_err(f"set_timestamp: {exc}"))
 
+                elif cmd == "set_echo":
+                    worker.set_echo(bool(req.get("enabled", False)))
+                    _send(conn, {"ok": True, "echo": worker.info()["echo"]})
+
                 elif cmd == "log_start":
                     path = req.get("path", "")
                     strip = bool(req.get("strip", False))
@@ -930,6 +954,8 @@ def main() -> None:
                     help="strip ANSI/control chars before writing log lines")
     ap.add_argument("--timestamp", default=None, choices=["iso8601", "24hour", "epoch"],
                     help="prepend timestamp to log lines")
+    ap.add_argument("--echo", action="store_true",
+                    help="echo transmitted commands into returned responses")
     ap.add_argument("--history-size", default=None, type=int, metavar="N",
                     help="RX ring buffer size in lines (default 1000)")
     args = ap.parse_args()
@@ -955,6 +981,7 @@ def main() -> None:
     log_file     = _get(args.log_file,     "log_file",     None)
     log_strip    = args.log_strip or bool(profile_cfg.get("log_strip", False))
     timestamp    = _get(args.timestamp,    "timestamp",    None)
+    echo_enabled = args.echo or bool(profile_cfg.get("echo", False))
     history_size = _get(args.history_size, "history_size", 1000)
 
     _setup_logging("awto-serial-daemon", args.log_level)
@@ -967,6 +994,8 @@ def main() -> None:
         worker.log_start(log_file)
     if timestamp:
         worker.set_timestamp(timestamp)
+    if echo_enabled:
+        worker.set_echo(True)
     try:
         worker.open()
     except serial.SerialException as exc:

@@ -75,6 +75,7 @@ Options:
 | `serial_set_eol` | `eol` | Change line ending (`lf`/`cr`/`crlf`) |
 | `serial_detect_baud` | `probe`, `timeout_ms` | Auto-detect baud (fastest-first: 2480000→9600) |
 | `serial_detect_eol` | `probe`, `timeout_ms` | Auto-detect line ending |
+| `serial_set_echo` | `enabled` | Enable or disable local echo of transmitted commands |
 | `serial_set_timestamp` | `format` | Set timestamp format: `iso8601` / `24hour` / `epoch` |
 | `serial_log_start` | `path`, `strip` | Start append-only RX logging (optional ANSI/control stripping) |
 | `serial_log_stop` | — | Stop RX logging |
@@ -112,6 +113,7 @@ send a break
 .venv-ft/bin/python ttu_cli.py set-eol crlf
 .venv-ft/bin/python ttu_cli.py detect-baud --probe "?"
 .venv-ft/bin/python ttu_cli.py detect-eol
+.venv-ft/bin/python ttu_cli.py set-echo on
 .venv-ft/bin/python ttu_cli.py set-timestamp iso8601
 .venv-ft/bin/python ttu_cli.py log-start /tmp/awto-rx.log --strip --timestamp 24hour
 .venv-ft/bin/python ttu_cli.py log-stop
