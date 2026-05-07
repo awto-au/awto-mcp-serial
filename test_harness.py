@@ -95,6 +95,17 @@ def _make_worker_with_mock(responses: list[bytes]) -> SerialWorker:
     worker._log_lock = threading.Lock()
     worker._ts_format = None
     worker._log_strip = False
+    worker._stats_lock = threading.Lock()
+    worker._rx_bytes = 0
+    worker._tx_bytes = 0
+    worker._error_count = 0
+    worker._start_time = time.monotonic()
+    worker._history = []
+    worker._history_lock = threading.Lock()
+    worker._rx_thread = None
+    worker._rx_stop = threading.Event()
+    worker._reconnecting = False
+    worker._reconnect_lock = threading.Lock()
 
     mock_ser = MagicMock()
     mock_ser.is_open = True
@@ -237,6 +248,10 @@ class TestSerialWorker(unittest.TestCase):
         self.assertIn("warning", out)
         self.assertIn("unterminated", out["warning"])
 
+    def test_query_hex_returns_space_separated_hex(self):
+        worker = self._worker(b"OK\n")
+        self.assertEqual(worker.query_hex("status", 100), "4f 4b 0a")
+
     def test_concurrent_queries_serialised(self):
         """Multiple threads calling query() must not interleave."""
         N = 20
@@ -344,6 +359,17 @@ class TestIntegration(unittest.TestCase):
         self._worker._log_lock = threading.Lock()
         self._worker._ts_format = None
         self._worker._log_strip = False
+        self._worker._stats_lock = threading.Lock()
+        self._worker._rx_bytes = 0
+        self._worker._tx_bytes = 0
+        self._worker._error_count = 0
+        self._worker._start_time = time.monotonic()
+        self._worker._history = []
+        self._worker._history_lock = threading.Lock()
+        self._worker._rx_thread = None
+        self._worker._rx_stop = threading.Event()
+        self._worker._reconnecting = False
+        self._worker._reconnect_lock = threading.Lock()
 
         mock_ser = MagicMock()
         mock_ser.is_open = True
@@ -397,6 +423,14 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["response"], "OK status")
         self.assertRegex(resp["timestamp"], r"^\d+\.\d{3}$")
+
+    def test_query_output_mode_hex(self):
+        resp = _client_query(
+            self._tmp,
+            {"cmd": "query", "line": "status", "timeout_ms": 200, "output_mode": "hex"},
+        )
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["response"], "4f 4b 20 73 74 61 74 75 73 0a")
 
     def test_unknown_cmd(self):
         resp = _client_query(self._tmp, {"cmd": "explode"})
@@ -492,6 +526,17 @@ class TestDetection(unittest.TestCase):
         worker._log_lock = threading.Lock()
         worker._ts_format = None
         worker._log_strip = False
+        worker._stats_lock = threading.Lock()
+        worker._rx_bytes = 0
+        worker._tx_bytes = 0
+        worker._error_count = 0
+        worker._start_time = time.monotonic()
+        worker._history = []
+        worker._history_lock = threading.Lock()
+        worker._rx_thread = None
+        worker._rx_stop = threading.Event()
+        worker._reconnecting = False
+        worker._reconnect_lock = threading.Lock()
 
         mock_ser = MagicMock()
         mock_ser.is_open = True
@@ -558,6 +603,17 @@ class TestDetection(unittest.TestCase):
         worker._log_lock = threading.Lock()
         worker._ts_format = None
         worker._log_strip = False
+        worker._stats_lock = threading.Lock()
+        worker._rx_bytes = 0
+        worker._tx_bytes = 0
+        worker._error_count = 0
+        worker._start_time = time.monotonic()
+        worker._history = []
+        worker._history_lock = threading.Lock()
+        worker._rx_thread = None
+        worker._rx_stop = threading.Event()
+        worker._reconnecting = False
+        worker._reconnect_lock = threading.Lock()
         mock_ser = MagicMock()
         mock_ser.is_open = True
         # always returns valid ASCII regardless of baud
@@ -620,6 +676,17 @@ class TestMapLogTimestamp(unittest.TestCase):
         w._log_strip = False
         w._lock = threading.Lock()
         w._ser = None
+        w._stats_lock = threading.Lock()
+        w._rx_bytes = 0
+        w._tx_bytes = 0
+        w._error_count = 0
+        w._start_time = time.monotonic()
+        w._history = []
+        w._history_lock = threading.Lock()
+        w._rx_thread = None
+        w._rx_stop = threading.Event()
+        w._reconnecting = False
+        w._reconnect_lock = threading.Lock()
         return w
 
     def test_set_map_valid(self):
@@ -776,6 +843,17 @@ class TestMcpClientEndToEnd(unittest.TestCase):
         worker._log_lock = threading.Lock()
         worker._ts_format = None
         worker._log_strip = False
+        worker._stats_lock = threading.Lock()
+        worker._rx_bytes = 0
+        worker._tx_bytes = 0
+        worker._error_count = 0
+        worker._start_time = time.monotonic()
+        worker._history = []
+        worker._history_lock = threading.Lock()
+        worker._rx_thread = None
+        worker._rx_stop = threading.Event()
+        worker._reconnecting = False
+        worker._reconnect_lock = threading.Lock()
         mock_ser = MagicMock()
         mock_ser.is_open = True
         written: list[bytes] = []

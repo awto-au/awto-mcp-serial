@@ -113,6 +113,7 @@ def serial_query(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     include_timestamp: bool = False,
     timestamp_format: str = "",
+    output_mode: str = "text",
 ) -> str:
     """Send an ASCII command to the serial device and return its response.
 
@@ -121,6 +122,7 @@ def serial_query(
         timeout_ms: How long to wait for the response in milliseconds (default 500).
         include_timestamp: Include timestamp in output when enabled.
         timestamp_format: Optional one-shot format: 'iso8601', '24hour', 'epoch'.
+        output_mode: 'text' (default) or 'hex' for space-separated hex bytes.
 
     Returns:
         The device's ASCII response, stripped of leading/trailing whitespace.
@@ -131,6 +133,7 @@ def serial_query(
         "line": command,
         "timeout_ms": timeout_ms,
         "include_timestamp": include_timestamp,
+        "output_mode": output_mode,
     }
     if timestamp_format:
         req["timestamp_format"] = timestamp_format

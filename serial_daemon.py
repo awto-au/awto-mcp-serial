@@ -191,8 +191,27 @@ class SerialWorker:
         or when the deadline expires — whichever comes first.
         """
         with self._lock:
-            result, _terminated = self._query_locked(line, timeout_ms)
-            return result
+            raw, _terminated = self._query_locked(line, timeout_ms)
+            return self._decode_response(raw)
+
+    def query_hex(self, line: str, timeout_ms: int) -> str:
+        """Send query and return response bytes as lowercase space-separated hex."""
+        with self._lock:
+            raw, _terminated = self._query_locked(line, timeout_ms)
+            return " ".join(f"{b:02x}" for b in raw)
+
+    def query_hex_full(self, line: str, timeout_ms: int) -> dict:
+        """Like query_hex() but includes warning when bytes are unterminated."""
+        with self._lock:
+            raw, terminated = self._query_locked(line, timeout_ms)
+            out: dict = {"response": " ".join(f"{b:02x}" for b in raw)}
+            if not terminated and raw:
+                out["warning"] = (
+                    "unterminated response: data received but no EOL (CR/LF) "
+                    "before timeout — device may have sent a partial line"
+                )
+                log.warning("unterminated response from device (hex mode): %r", raw[:40])
+            return out
 
     def query_full(self, line: str, timeout_ms: int) -> dict:
         """Like query() but returns a dict with an optional 'warning' key.
@@ -201,7 +220,8 @@ class SerialWorker:
         ``warning`` is set to explain the issue so callers can alert the user.
         """
         with self._lock:
-            result, terminated = self._query_locked(line, timeout_ms)
+            raw, terminated = self._query_locked(line, timeout_ms)
+            result = self._decode_response(raw)
             out: dict = {"response": result}
             if not terminated and result:
                 out["warning"] = (
@@ -214,7 +234,8 @@ class SerialWorker:
     def query_with_timestamp(self, line: str, timeout_ms: int, ts_format: str | None) -> dict:
         """Send query and optionally include a timestamp in the response payload."""
         with self._lock:
-            result, terminated = self._query_locked(line, timeout_ms)
+            raw, terminated = self._query_locked(line, timeout_ms)
+            result = self._decode_response(raw)
             fmt = self._normalize_ts_format(ts_format) if ts_format is not None else self._ts_format
             ts = self._format_ts_for(fmt)
             out: dict = {"response": result}
@@ -228,8 +249,8 @@ class SerialWorker:
                 log.warning("unterminated response from device: %r", result[:80])
             return out
 
-    def _query_locked(self, line: str, timeout_ms: int) -> tuple[str, bool]:
-        """Core send/receive. Returns (result, terminated).
+    def _query_locked(self, line: str, timeout_ms: int) -> tuple[bytes, bool]:
+        """Core send/receive. Returns (raw_bytes, terminated).
 
         *terminated* is True when the loop exited because an EOL byte was
         seen, False when it exited because the deadline expired.  Callers
@@ -261,9 +282,12 @@ class SerialWorker:
                     terminated = True
                     break
 
-        result = self._apply_input_map(bytes(buf)).decode(errors="replace").strip()
+        return bytes(buf), terminated
+
+    def _decode_response(self, data: bytes) -> str:
+        result = self._apply_input_map(data).decode(errors="replace").strip()
         self._log_line(result)
-        return result, terminated
+        return result
 
     # ------------------------------------------------------------------
     def detect_baud(
@@ -291,9 +315,10 @@ class SerialWorker:
                     continue
                 self._baud = rate
                 try:
-                    resp, _terminated = self._query_locked(probe, timeout_ms)
+                    raw, _terminated = self._query_locked(probe, timeout_ms)
                 except IOError:
                     continue
+                resp = self._apply_input_map(raw).decode(errors="replace").strip()
                 score = _ascii_score(resp)
                 log.debug("probe %d → %r (score=%.2f)", rate, resp[:40], score)
                 if score >= 0.8 and len(resp) >= 4:
@@ -716,9 +741,19 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                     timeout_ms = int(req.get("timeout_ms", 500))
                     include_ts = bool(req.get("include_timestamp", False))
                     ts_fmt = req.get("timestamp_format")
+                    output_mode = str(req.get("output_mode", "text")).lower()
                     try:
+                        if output_mode not in ("text", "hex"):
+                            _send(conn, make_err("query: output_mode must be 'text' or 'hex'"))
+                            continue
                         if include_ts:
+                            if output_mode != "text":
+                                _send(conn, make_err("query: include_timestamp requires output_mode='text'"))
+                                continue
                             out = worker.query_with_timestamp(line_str, timeout_ms, ts_fmt)
+                            _send(conn, {"ok": True, **out})
+                        elif output_mode == "hex":
+                            out = worker.query_hex_full(line_str, timeout_ms)
                             _send(conn, {"ok": True, **out})
                         else:
                             out = worker.query_full(line_str, timeout_ms)

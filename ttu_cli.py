@@ -284,6 +284,8 @@ def main() -> None:
                           help="command text (or omit to read from stdin)")
     sp_query.add_argument("--timestamp", choices=["iso8601", "24hour", "epoch"],
                           help="include timestamp in the response")
+    sp_query.add_argument("--output-mode", choices=["text", "hex"], default="text",
+                          help="response format (default: text)")
 
     sub.add_parser("ping", help="health-check the daemon")
     sub.add_parser("info", help="show current port / baud / eol")
@@ -450,6 +452,7 @@ def main() -> None:
             text = sys.stdin.read().strip()
         log.debug("query: %r timeout=%dms", text, args.timeout)
         req = {"cmd": "query", "line": text, "timeout_ms": args.timeout}
+        req["output_mode"] = getattr(args, "output_mode", "text")
         if getattr(args, "timestamp", None):
             req["include_timestamp"] = True
             req["timestamp_format"] = args.timestamp

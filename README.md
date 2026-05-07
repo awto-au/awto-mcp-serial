@@ -69,7 +69,7 @@ Options:
 | Tool | Arguments | Description |
 |------|-----------|-------------|
 | `serial_ping` | — | Check daemon is alive |
-| `serial_query` | `command`, `timeout_ms`, `include_timestamp`, `timestamp_format` | Send a command, read response (optional timestamp) |
+| `serial_query` | `command`, `timeout_ms`, `include_timestamp`, `timestamp_format`, `output_mode` | Send a command, read response (optional timestamp or raw hex mode) |
 | `serial_info` | — | Show port, baud, eol, is_open |
 | `serial_set_baud` | `baud` | Change baud rate live |
 | `serial_set_eol` | `eol` | Change line ending (`lf`/`cr`/`crlf`) |
@@ -106,6 +106,7 @@ send a break
 .venv-ft/bin/python ttu_cli.py ping
 .venv-ft/bin/python ttu_cli.py info
 .venv-ft/bin/python ttu_cli.py query "status"
+.venv-ft/bin/python ttu_cli.py query "status" --output-mode hex
 .venv-ft/bin/python ttu_cli.py query "status" --timestamp epoch
 .venv-ft/bin/python ttu_cli.py set-baud 2480000
 .venv-ft/bin/python ttu_cli.py set-eol crlf
