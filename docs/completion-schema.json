@@ -1,0 +1,177 @@
+{
+  "schema": {
+    "version": "1",
+    "type": "object",
+    "required": [
+      "version",
+      "commands"
+    ],
+    "properties": {
+      "version": {
+        "type": "string",
+        "enum": [
+          "1"
+        ]
+      },
+      "name": {
+        "type": "string"
+      },
+      "commands": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/command"
+        }
+      }
+    },
+    "$defs": {
+      "command": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "subcommands": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/command"
+            }
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "type"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "string",
+                    "integer",
+                    "choice",
+                    "path"
+                  ]
+                },
+                "choices": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "example": {
+    "version": "1",
+    "name": "mydevice",
+    "commands": [
+      {
+        "name": "esp",
+        "description": "ESP32 subsystem",
+        "subcommands": [
+          {
+            "name": "status",
+            "description": "Show ESP link status"
+          },
+          {
+            "name": "reset",
+            "description": "Hard-reset the ESP32"
+          },
+          {
+            "name": "send",
+            "description": "Send raw AT command",
+            "args": [
+              {
+                "name": "at_cmd",
+                "description": "AT command string e.g. AT+GMR",
+                "type": "string"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "gpio",
+        "description": "GPIO control",
+        "subcommands": [
+          {
+            "name": "set",
+            "description": "Set GPIO pin high or low",
+            "args": [
+              {
+                "name": "pin",
+                "type": "integer",
+                "choices": [
+                  "0",
+                  "1",
+                  "2",
+                  "3",
+                  "4",
+                  "5",
+                  "6",
+                  "7"
+                ]
+              },
+              {
+                "name": "value",
+                "type": "choice",
+                "choices": [
+                  "0",
+                  "1",
+                  "high",
+                  "low"
+                ]
+              }
+            ]
+          },
+          {
+            "name": "read",
+            "description": "Read GPIO pin state",
+            "args": [
+              {
+                "name": "pin",
+                "type": "integer",
+                "choices": [
+                  "0",
+                  "1",
+                  "2",
+                  "3",
+                  "4",
+                  "5",
+                  "6",
+                  "7"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "version",
+        "description": "Show firmware version"
+      },
+      {
+        "name": "reboot",
+        "description": "Reboot the device"
+      }
+    ]
+  }
+}
