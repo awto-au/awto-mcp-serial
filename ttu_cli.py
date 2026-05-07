@@ -160,14 +160,41 @@ def main() -> None:
                        choices=["iso8601", "24hour", "epoch", ""],
                        help="timestamp format (empty to disable)")
 
+    sub.add_parser("stats", help="show RX/TX byte counts and uptime")
+
+    sp_hist = sub.add_parser("history", help="show received lines (newest first)")
+    sp_hist.add_argument("--limit", type=int, default=50, help="max lines (default 50)")
+    sp_hist.add_argument("--offset", type=int, default=0, help="skip N lines from newest")
+
+    sub.add_parser("list-ports", help="list available serial ports")
+
+    sp_sl = sub.add_parser("set-line", help="set DTR or RTS line state")
+    sp_sl.add_argument("line", choices=["dtr", "rts"])
+    sp_sl.add_argument("state", choices=["high", "low", "toggle"])
+
+    sp_sb = sub.add_parser("send-break", help="send serial BREAK condition")
+    sp_sb.add_argument("--duration", type=int, default=250, metavar="MS",
+                       help="duration in ms (default 250)")
+
+    sp_pl = sub.add_parser("pulse-line", help="pulse DTR or RTS (high → wait → low)")
+    sp_pl.add_argument("line", choices=["dtr", "rts"])
+    sp_pl.add_argument("--duration", type=int, default=100, metavar="MS",
+                       help="pulse duration in ms (default 100)")
+
     # Back-compat: ``ttu_cli.py "status"`` with no subcommand → query
     args, leftover = ap.parse_known_args()
     if args.subcmd is None and leftover:
         args.subcmd = "query"
         args.text = " ".join(leftover)
     elif args.subcmd is None:
-        ap.print_help()
-        sys.exit(2)
+        # also handle stdin pipe with no subcommand
+        if not sys.stdin.isatty():
+            args.subcmd = "query"
+            args.text = None
+            args.timestamp = None
+        else:
+            ap.print_help()
+            sys.exit(2)
 
     _setup_logging(args.verbose)
 
@@ -198,6 +225,47 @@ def main() -> None:
         resp = _call({"cmd": "log_stop"})
     elif args.subcmd == "set-timestamp":
         resp = _call({"cmd": "set_timestamp", "format": args.format})
+    elif args.subcmd == "stats":
+        resp = _call({"cmd": "stats"})
+        if resp.get("ok"):
+            s = resp.get("stats", {})
+            for k, v in s.items():
+                print(f"{k}: {v}")
+            sys.exit(0)
+        else:
+            print(f"error: {resp.get('error', 'unknown')}", file=sys.stderr)
+            sys.exit(1)
+    elif args.subcmd == "history":
+        resp = _call({"cmd": "history", "limit": args.limit, "offset": args.offset})
+        if resp.get("ok"):
+            for entry in resp.get("lines", []):
+                print(f"[{entry.get('ts', '')}] {entry.get('line', '')}")
+            print(f"  ({resp.get('total', 0)} total, offset={resp.get('offset', 0)})")
+            sys.exit(0)
+        else:
+            print(f"error: {resp.get('error', 'unknown')}", file=sys.stderr)
+            sys.exit(1)
+    elif args.subcmd == "list-ports":
+        resp = _call({"cmd": "list_ports"})
+        if resp.get("ok"):
+            ports = resp.get("ports", [])
+            if not ports:
+                print("no serial ports found")
+            for p in ports:
+                vid = f"{p['vid']:04X}" if p.get("vid") else "????"
+                pid = f"{p['pid']:04X}" if p.get("pid") else "????"
+                desc = p.get("description") or p.get("hwid") or ""
+                print(f"{p['device']:<20} {vid}:{pid}  {desc}")
+            sys.exit(0)
+        else:
+            print(f"error: {resp.get('error', 'unknown')}", file=sys.stderr)
+            sys.exit(1)
+    elif args.subcmd == "set-line":
+        resp = _call({"cmd": "set_line", "line": args.line, "state": args.state})
+    elif args.subcmd == "send-break":
+        resp = _call({"cmd": "send_break", "duration_ms": args.duration})
+    elif args.subcmd == "pulse-line":
+        resp = _call({"cmd": "pulse_line", "line": args.line, "duration_ms": args.duration})
     elif args.subcmd == "query":
         text = args.text
         if text is None:

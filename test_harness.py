@@ -215,6 +215,28 @@ class TestSerialWorker(unittest.TestCase):
         with self.assertRaises(IOError):
             worker.query("anything", 100)
 
+    def test_query_unterminated_no_warning_on_empty(self):
+        """Timeout with zero bytes → no warning (device is silent, not partial)."""
+        worker = _make_worker_with_mock([b""])
+        out = worker.query_full("status", 50)
+        self.assertEqual(out["response"], "")
+        self.assertNotIn("warning", out)
+
+    def test_query_full_terminated_no_warning(self):
+        """EOL-terminated response → no warning in query_full()."""
+        worker = self._worker(b"OK 42\n")
+        out = worker.query_full("status", 200)
+        self.assertEqual(out["response"], "OK 42")
+        self.assertNotIn("warning", out)
+
+    def test_query_full_unterminated_warns(self):
+        """Data without EOL before timeout → warning key present in query_full()."""
+        worker = _make_worker_with_mock([b"partial"])
+        out = worker.query_full("status", 50)
+        self.assertEqual(out["response"], "partial")
+        self.assertIn("warning", out)
+        self.assertIn("unterminated", out["warning"])
+
     def test_concurrent_queries_serialised(self):
         """Multiple threads calling query() must not interleave."""
         N = 20
@@ -412,6 +434,29 @@ class TestIntegration(unittest.TestCase):
         # Every result must be a valid "OK cmd<n>" — no mixing
         for r in results:
             self.assertRegex(r, r"^OK cmd\d+$")
+
+    def test_query_unterminated_response_warns(self):
+        """Daemon must surface a 'warning' key when device sends no EOL."""
+        # Override the mock to return data with no newline terminator
+        written: list[bytes] = []
+
+        def _write(data: bytes):
+            written.append(data)
+
+        def _read(_n):
+            if written:
+                written.pop(0)
+                return b"partial-no-eol"   # no \n or \r
+            return b""
+
+        self._worker._ser.write.side_effect = _write
+        self._worker._ser.read.side_effect = _read
+
+        resp = _client_query(self._tmp, {"cmd": "query", "line": "status", "timeout_ms": 100})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["response"], "partial-no-eol")
+        self.assertIn("warning", resp)
+        self.assertIn("unterminated", resp["warning"])
 
     def test_throughput(self):
         """Measure round-trip latency for sequential queries (informational)."""

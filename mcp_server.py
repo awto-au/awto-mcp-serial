@@ -146,6 +146,10 @@ def serial_query(
     ts = resp.get("timestamp")
     if ts:
         result = f"[{ts}] {result}"
+    warning = resp.get("warning")
+    if warning:
+        log.warning("serial_query: %s", warning)
+        result = f"{result}\n[WARNING: {warning}]"
     log.debug("serial_query response: %r", result[:120])
     return result
 
@@ -334,6 +338,242 @@ def serial_log_stop() -> str:
         return resp.get("response", "ok")
     except OSError as exc:
         return f"error: {exc}"
+
+
+@mcp.tool()
+def serial_list_ports() -> list:
+    """List all available serial ports with VID:PID, description, and device path.
+
+    Returns:
+        List of dicts with device, description, hwid, vid, pid, serial_number, manufacturer.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "list_ports"})
+        if not resp.get("ok"):
+            return [{"error": resp.get("error", "unknown")}]
+        return resp.get("ports", [])
+    except OSError as exc:
+        return [{"error": str(exc)}]
+
+
+@mcp.tool()
+def serial_stats() -> dict:
+    """Return cumulative RX bytes, TX bytes, error count, and uptime since daemon start."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "stats"})
+        if not resp.get("ok"):
+            return {"error": resp.get("error", "unknown")}
+        return resp.get("stats", {})
+    except OSError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def serial_history(limit: int = 50, offset: int = 0) -> dict:
+    """Return received serial lines from the ring buffer, newest first.
+
+    Args:
+        limit:  Max lines to return (default 50, max 500).
+        offset: Skip N lines from newest (for pagination).
+
+    Returns:
+        Dict with 'lines' (list of {ts, line}), 'total', and 'offset'.
+    """
+    limit = min(max(1, limit), 500)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "history", "limit": limit, "offset": offset})
+        if not resp.get("ok"):
+            return {"error": resp.get("error", "unknown")}
+        return {"lines": resp.get("lines", []), "total": resp.get("total", 0), "offset": resp.get("offset", 0)}
+    except OSError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def serial_set_line(line: str, state: str) -> str:
+    """Set DTR or RTS control line high, low, or toggle.
+
+    Args:
+        line:  'dtr' or 'rts'
+        state: 'high', 'low', or 'toggle'
+
+    Returns:
+        'ok (line=dtr state=high)' or error.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "set_line", "line": line, "state": state})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return f"ok (line={resp.get('line')} state={resp.get('state')})"
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def serial_send_break(duration_ms: int = 250) -> str:
+    """Send a serial BREAK condition for the specified duration.
+
+    Args:
+        duration_ms: Duration in milliseconds (default 250).
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "send_break", "duration_ms": duration_ms})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return resp.get("response", "ok")
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def serial_pulse_line(line: str, duration_ms: int = 100) -> str:
+    """Pulse DTR or RTS: assert high, wait duration_ms, then drive low.
+
+    Useful for MCU reset / boot-mode entry (e.g. STM32 reset via DTR).
+
+    Args:
+        line:        'dtr' or 'rts'
+        duration_ms: Pulse duration in milliseconds (default 100).
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(_sock_path())
+            resp = send_request(sock, {"cmd": "pulse_line", "line": line, "duration_ms": duration_ms})
+        if not resp.get("ok"):
+            return f"error: {resp.get('error', 'unknown')}"
+        return resp.get("response", "ok")
+    except OSError as exc:
+        return f"error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    mcp.run()
+
+@mcp.tool()
+def serial_completion_schema() -> dict:
+    """Return the JSON schema a device firmware should implement for monitor tab-completion.
+
+    The ``ttu_cli.py monitor`` subcommand sends a configurable command to the device
+    at startup (default: ``help --json``) and expects a JSON response matching this
+    schema.  The schema is used to build readline tab-completion trees for interactive
+    use, and can also be loaded from a local file via ``--complete-file``.
+
+    Schema fields:
+      version     (str)  Schema version; currently "1".
+      name        (str)  Device/project name (informational).
+      commands    (list) Top-level command descriptors.
+
+    Each command descriptor:
+      name        (str)       Command token used on the serial line.
+      description (str)       Short human-readable description.
+      subcommands (list, opt) Nested sub-commands (same structure, recursive).
+      args        (list, opt) Positional arguments after the command.
+
+    Each arg descriptor:
+      name        (str)        Argument name (shown in completion hints).
+      description (str, opt)   Short description.
+      type        (str)        One of: 'string', 'integer', 'choice', 'path'.
+      choices     (list, opt)  Enumerated valid values (used for tab-completion).
+
+    Returns:
+        Dict with 'schema' (the JSON schema) and 'example' (a sample document).
+    """
+    schema = {
+        "version": "1",
+        "type": "object",
+        "required": ["version", "commands"],
+        "properties": {
+            "version":  {"type": "string", "enum": ["1"]},
+            "name":     {"type": "string"},
+            "commands": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/command"},
+            },
+        },
+        "$defs": {
+            "command": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name":        {"type": "string"},
+                    "description": {"type": "string"},
+                    "subcommands": {"type": "array", "items": {"$ref": "#/$defs/command"}},
+                    "args": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "type"],
+                            "properties": {
+                                "name":        {"type": "string"},
+                                "description": {"type": "string"},
+                                "type":        {"type": "string", "enum": ["string", "integer", "choice", "path"]},
+                                "choices":     {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+    example = {
+        "version": "1",
+        "name": "mydevice",
+        "commands": [
+            {
+                "name": "esp",
+                "description": "ESP32 subsystem",
+                "subcommands": [
+                    {"name": "status", "description": "Show ESP link status"},
+                    {"name": "reset",  "description": "Hard-reset the ESP32"},
+                    {
+                        "name": "send",
+                        "description": "Send raw AT command",
+                        "args": [
+                            {"name": "at_cmd", "description": "AT command string e.g. AT+GMR", "type": "string"},
+                        ],
+                    },
+                ],
+            },
+            {
+                "name": "gpio",
+                "description": "GPIO control",
+                "subcommands": [
+                    {
+                        "name": "set",
+                        "description": "Set GPIO pin high or low",
+                        "args": [
+                            {"name": "pin",   "type": "integer", "choices": ["0","1","2","3","4","5","6","7"]},
+                            {"name": "value", "type": "choice",  "choices": ["0","1","high","low"]},
+                        ],
+                    },
+                    {
+                        "name": "read",
+                        "description": "Read GPIO pin state",
+                        "args": [
+                            {"name": "pin", "type": "integer", "choices": ["0","1","2","3","4","5","6","7"]},
+                        ],
+                    },
+                ],
+            },
+            {"name": "version", "description": "Show firmware version"},
+            {"name": "reboot",  "description": "Reboot the device"},
+        ],
+    }
+    return {"schema": schema, "example": example}
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ Requires the free-threaded (no-GIL) CPython build: python3.13t
 """
 
 import argparse
+import collections
 import datetime
 import json
 import logging
@@ -25,6 +26,7 @@ import sys
 import threading
 import time
 import serial
+import serial.tools.list_ports
 
 from protocol import (
     CANDIDATE_BAUDS,
@@ -88,7 +90,8 @@ def _setup_logging(ident: str, level_name: str) -> None:
 class SerialWorker:
     """Owns the serial port and exposes a thread-safe query() method."""
 
-    def __init__(self, port: str, baud: int, eol: str = DEFAULT_EOL) -> None:
+    def __init__(self, port: str, baud: int, eol: str = DEFAULT_EOL,
+                 history_size: int = 1000) -> None:
         self._port = port
         self._baud = baud
         self._eol = eol
@@ -100,6 +103,23 @@ class SerialWorker:
         self._log_lock = threading.Lock()
         self._log_strip = False
         self._ts_format: str | None = None
+
+        # RX/TX statistics
+        self._rx_bytes = 0
+        self._tx_bytes = 0
+        self._error_count = 0
+        self._start_time = time.monotonic()
+        self._stats_lock = threading.Lock()
+
+        # RX ring buffer (background reader)
+        self._history: collections.deque = collections.deque(maxlen=history_size)
+        self._history_lock = threading.Lock()
+        self._rx_thread: threading.Thread | None = None
+        self._rx_stop = threading.Event()
+
+        # Auto-reconnect state
+        self._reconnecting = False
+        self._reconnect_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     @property
@@ -123,8 +143,10 @@ class SerialWorker:
             write_timeout=0.2,
         )
         log.info("serial open: %s @ %d (eol=%s)", self._port, self._baud, self._eol)
+        self._start_rx_thread()
 
     def close(self) -> None:
+        self._stop_rx_thread()
         self.log_stop()
         if self._ser and self._ser.is_open:
             self._ser.close()
@@ -169,20 +191,50 @@ class SerialWorker:
         or when the deadline expires — whichever comes first.
         """
         with self._lock:
-            return self._query_locked(line, timeout_ms)
+            result, _terminated = self._query_locked(line, timeout_ms)
+            return result
+
+    def query_full(self, line: str, timeout_ms: int) -> dict:
+        """Like query() but returns a dict with an optional 'warning' key.
+
+        If the device sends data with no EOL terminator before the deadline,
+        ``warning`` is set to explain the issue so callers can alert the user.
+        """
+        with self._lock:
+            result, terminated = self._query_locked(line, timeout_ms)
+            out: dict = {"response": result}
+            if not terminated and result:
+                out["warning"] = (
+                    "unterminated response: data received but no EOL (CR/LF) "
+                    "before timeout — device may have sent a partial line"
+                )
+                log.warning("unterminated response from device: %r", result[:80])
+            return out
 
     def query_with_timestamp(self, line: str, timeout_ms: int, ts_format: str | None) -> dict:
         """Send query and optionally include a timestamp in the response payload."""
         with self._lock:
-            response = self._query_locked(line, timeout_ms)
+            result, terminated = self._query_locked(line, timeout_ms)
             fmt = self._normalize_ts_format(ts_format) if ts_format is not None else self._ts_format
             ts = self._format_ts_for(fmt)
-            out = {"response": response}
+            out: dict = {"response": result}
             if ts:
                 out["timestamp"] = ts
+            if not terminated and result:
+                out["warning"] = (
+                    "unterminated response: data received but no EOL (CR/LF) "
+                    "before timeout — device may have sent a partial line"
+                )
+                log.warning("unterminated response from device: %r", result[:80])
             return out
 
-    def _query_locked(self, line: str, timeout_ms: int) -> str:
+    def _query_locked(self, line: str, timeout_ms: int) -> tuple[str, bool]:
+        """Core send/receive. Returns (result, terminated).
+
+        *terminated* is True when the loop exited because an EOL byte was
+        seen, False when it exited because the deadline expired.  Callers
+        should treat (non-empty result, terminated=False) as a warning.
+        """
         if self._ser is None or not self._ser.is_open:
             raise IOError("serial port not open")
 
@@ -191,21 +243,27 @@ class SerialWorker:
         self._ser.reset_input_buffer()
         self._ser.write(payload)
         self._ser.flush()
+        with self._stats_lock:
+            self._tx_bytes += len(payload)
 
         deadline = time.monotonic() + timeout_ms / 1000.0
         buf = bytearray()
+        terminated = False
 
         while time.monotonic() < deadline:
             chunk = self._ser.read(4096)
             if chunk:
                 buf.extend(chunk)
+                with self._stats_lock:
+                    self._rx_bytes += len(chunk)
                 # stop as soon as we have any complete line (CR or LF)
                 if b"\n" in chunk or b"\r" in chunk:
+                    terminated = True
                     break
 
         result = self._apply_input_map(bytes(buf)).decode(errors="replace").strip()
         self._log_line(result)
-        return result
+        return result, terminated
 
     # ------------------------------------------------------------------
     def detect_baud(
@@ -233,7 +291,7 @@ class SerialWorker:
                     continue
                 self._baud = rate
                 try:
-                    resp = self._query_locked(probe, timeout_ms)
+                    resp, _terminated = self._query_locked(probe, timeout_ms)
                 except IOError:
                     continue
                 score = _ascii_score(resp)
@@ -400,6 +458,210 @@ class SerialWorker:
             return False
         return self._ser.is_open
 
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+    def stats(self) -> dict:
+        with self._stats_lock:
+            return {
+                "rx_bytes": self._rx_bytes,
+                "tx_bytes": self._tx_bytes,
+                "error_count": self._error_count,
+                "uptime_s": round(time.monotonic() - self._start_time, 1),
+            }
+
+    # ------------------------------------------------------------------
+    # RX history ring buffer
+    # ------------------------------------------------------------------
+    def history(self, limit: int = 50, offset: int = 0) -> dict:
+        with self._history_lock:
+            # deque is newest-last internally; reverse for newest-first output
+            items = list(reversed(self._history))
+            total = len(items)
+        page = items[offset: offset + limit]
+        return {"lines": page, "total": total, "offset": offset}
+
+    # ------------------------------------------------------------------
+    # DTR / RTS / BREAK
+    # ------------------------------------------------------------------
+    def set_line(self, line: str, state: str) -> None:
+        """Set DTR or RTS high/low/toggle.  line: 'dtr'|'rts', state: 'high'|'low'|'toggle'."""
+        line = line.lower()
+        state = state.lower()
+        if line not in ("dtr", "rts"):
+            raise ValueError(f"line must be 'dtr' or 'rts', got {line!r}")
+        with self._lock:
+            if self._ser is None or not self._ser.is_open:
+                raise IOError("serial port not open")
+            if line == "dtr":
+                current = self._ser.dtr
+                new_val = (not current) if state == "toggle" else (state == "high")
+                self._ser.dtr = new_val
+            else:
+                current = self._ser.rts
+                new_val = (not current) if state == "toggle" else (state == "high")
+                self._ser.rts = new_val
+        log.info("set_line: %s=%s", line, state)
+
+    def send_break(self, duration_ms: int = 250) -> None:
+        with self._lock:
+            if self._ser is None or not self._ser.is_open:
+                raise IOError("serial port not open")
+            self._ser.send_break(duration=duration_ms / 1000.0)
+        log.info("send_break: %d ms", duration_ms)
+
+    def pulse_line(self, line: str, duration_ms: int = 100) -> None:
+        """Pulse DTR or RTS: assert high, wait duration_ms, then low."""
+        line = line.lower()
+        if line not in ("dtr", "rts"):
+            raise ValueError(f"line must be 'dtr' or 'rts', got {line!r}")
+        with self._lock:
+            if self._ser is None or not self._ser.is_open:
+                raise IOError("serial port not open")
+            if line == "dtr":
+                self._ser.dtr = True
+                time.sleep(duration_ms / 1000.0)
+                self._ser.dtr = False
+            else:
+                self._ser.rts = True
+                time.sleep(duration_ms / 1000.0)
+                self._ser.rts = False
+        log.info("pulse_line: %s %d ms", line, duration_ms)
+
+    # ------------------------------------------------------------------
+    # Background RX reader thread
+    # ------------------------------------------------------------------
+    def _start_rx_thread(self) -> None:
+        self._rx_stop.clear()
+        self._rx_thread = threading.Thread(
+            target=self._rx_reader_loop, daemon=True, name="rx-reader"
+        )
+        self._rx_thread.start()
+
+    def _stop_rx_thread(self) -> None:
+        self._rx_stop.set()
+        if self._rx_thread and self._rx_thread.is_alive():
+            self._rx_thread.join(timeout=1.0)
+        self._rx_thread = None
+
+    def _rx_reader_loop(self) -> None:
+        """Background thread: continuously read RX bytes into history ring buffer.
+
+        Skips reads while _lock is held (i.e. while query() is active) to avoid
+        competing with the query send/receive cycle and double-counting stats.
+        """
+        line_buf = bytearray()
+        while not self._rx_stop.is_set():
+            with self._reconnect_lock:
+                reconnecting = self._reconnecting
+            if reconnecting:
+                time.sleep(0.05)
+                continue
+            # Only read passively when no query is in flight
+            acquired = self._lock.acquire(blocking=False)
+            if not acquired:
+                time.sleep(0.001)
+                continue
+            try:
+                ser = self._ser
+                if ser is None or not ser.is_open:
+                    time.sleep(0.05)
+                    continue
+                chunk = ser.read(256)  # small read to yield lock quickly
+            except serial.SerialException as exc:
+                log.warning("rx reader: serial error: %s — reconnecting", exc)
+                with self._stats_lock:
+                    self._error_count += 1
+                self._schedule_reconnect()
+                time.sleep(0.1)
+                continue
+            except OSError:
+                time.sleep(0.05)
+                continue
+            finally:
+                self._lock.release()
+
+            if chunk:
+                with self._stats_lock:
+                    self._rx_bytes += len(chunk)
+                line_buf.extend(chunk)
+                while True:
+                    for sep in (b"\r\n", b"\n", b"\r"):
+                        idx = line_buf.find(sep)
+                        if idx >= 0:
+                            raw_line = line_buf[:idx]
+                            line_buf = line_buf[idx + len(sep):]
+                            text = raw_line.decode(errors="replace").strip()
+                            if text:
+                                ts = (self._format_ts_for(self._ts_format)
+                                      or datetime.datetime.now().isoformat(timespec="milliseconds"))
+                                entry = {"ts": ts, "line": text}
+                                with self._history_lock:
+                                    self._history.append(entry)
+                                self._log_line(text)
+                            break
+                    else:
+                        break
+
+    # ------------------------------------------------------------------
+    # Auto-reconnect
+    # ------------------------------------------------------------------
+    def _schedule_reconnect(self) -> None:
+        with self._reconnect_lock:
+            if self._reconnecting:
+                return
+            self._reconnecting = True
+        t = threading.Thread(target=self._reconnect_loop, daemon=True, name="reconnect")
+        t.start()
+
+    def _reconnect_loop(self) -> None:
+        delay = 0.1
+        max_delay = 5.0
+        while not self._rx_stop.is_set():
+            log.info("reconnect: closing port, retry in %.1fs", delay)
+            try:
+                with self._lock:
+                    if self._ser and self._ser.is_open:
+                        self._ser.close()
+                    self._ser = None
+            except OSError:
+                pass
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay)
+            try:
+                ser = serial.Serial(
+                    self._port,
+                    baudrate=self._baud,
+                    timeout=0.01,
+                    write_timeout=0.2,
+                )
+                with self._lock:
+                    self._ser = ser
+                with self._reconnect_lock:
+                    self._reconnecting = False
+                log.info("reconnect: port re-opened successfully")
+                return
+            except serial.SerialException as exc:
+                log.debug("reconnect: still failing: %s", exc)
+
+
+def _list_ports() -> list[dict]:
+    """Return available serial ports as a list of dicts, newest (highest tty num) last."""
+    ports = []
+    for p in serial.tools.list_ports.comports():
+        ports.append({
+            "device": p.device,
+            "description": p.description or "",
+            "hwid": p.hwid or "",
+            "vid": p.vid,
+            "pid": p.pid,
+            "serial_number": p.serial_number or "",
+            "manufacturer": p.manufacturer or "",
+            "product": p.product or "",
+        })
+    ports.sort(key=lambda x: x["device"])
+    return ports
+
 
 def _ascii_score(s: str) -> float:
     """Fraction of characters in *s* that are printable ASCII or whitespace."""
@@ -437,9 +699,19 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                 cmd = req.get("cmd", "")
 
                 if cmd == "ping":
-                    _send(conn, make_ok("pong"))
+                    with worker._reconnect_lock:
+                        reconnecting = worker._reconnecting
+                    if reconnecting:
+                        _send(conn, make_err("reconnecting: serial port temporarily unavailable"))
+                    else:
+                        _send(conn, make_ok("pong"))
 
                 elif cmd == "query":
+                    with worker._reconnect_lock:
+                        reconnecting = worker._reconnecting
+                    if reconnecting:
+                        _send(conn, make_err("reconnecting: serial port temporarily unavailable"))
+                        continue
                     line_str = req.get("line", "")
                     timeout_ms = int(req.get("timeout_ms", 500))
                     include_ts = bool(req.get("include_timestamp", False))
@@ -449,8 +721,8 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                             out = worker.query_with_timestamp(line_str, timeout_ms, ts_fmt)
                             _send(conn, {"ok": True, **out})
                         else:
-                            resp = worker.query(line_str, timeout_ms)
-                            _send(conn, make_ok(resp))
+                            out = worker.query_full(line_str, timeout_ms)
+                            _send(conn, {"ok": True, **out})
                     except (IOError, ValueError) as exc:
                         _send(conn, make_err(str(exc)))
 
@@ -522,6 +794,38 @@ def handle_client(conn: socket.socket, addr: str, worker: SerialWorker) -> None:
                     worker.log_stop()
                     _send(conn, make_ok("log stopped"))
 
+                elif cmd == "stats":
+                    _send(conn, {"ok": True, "stats": worker.stats()})
+
+                elif cmd == "history":
+                    limit = int(req.get("limit", 50))
+                    offset = int(req.get("offset", 0))
+                    _send(conn, {"ok": True, **worker.history(limit, offset)})
+
+                elif cmd == "list_ports":
+                    _send(conn, {"ok": True, "ports": _list_ports()})
+
+                elif cmd == "set_line":
+                    try:
+                        worker.set_line(req.get("line", ""), req.get("state", ""))
+                        _send(conn, {"ok": True, "line": req.get("line"), "state": req.get("state")})
+                    except (ValueError, IOError) as exc:
+                        _send(conn, make_err(f"set_line: {exc}"))
+
+                elif cmd == "send_break":
+                    try:
+                        worker.send_break(int(req.get("duration_ms", 250)))
+                        _send(conn, make_ok("break sent"))
+                    except (IOError, ValueError) as exc:
+                        _send(conn, make_err(f"send_break: {exc}"))
+
+                elif cmd == "pulse_line":
+                    try:
+                        worker.pulse_line(req.get("line", ""), int(req.get("duration_ms", 100)))
+                        _send(conn, make_ok(f"pulsed {req.get('line')}"))
+                    except (ValueError, IOError) as exc:
+                        _send(conn, make_err(f"pulse_line: {exc}"))
+
                 else:
                     _send(conn, make_err(f"unknown cmd: {cmd!r}"))
 
@@ -543,17 +847,47 @@ def _send(conn: socket.socket, obj: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _load_profile(profile: str) -> dict:
+    """Load named profile from ~/.config/awto-serial/config.toml.
+
+    Returns a dict of key→value for the profile (merged with [default]).
+    Returns empty dict if config file or profile doesn't exist.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        log.warning("tomllib not available (Python < 3.11); profiles disabled")
+        return {}
+
+    config_path = os.path.expanduser("~/.config/awto-serial/config.toml")
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path, "rb") as f:
+            config = tomllib.load(f)
+    except Exception as exc:
+        log.warning("failed to load config %s: %s", config_path, exc)
+        return {}
+
+    result = dict(config.get("default", {}))
+    if profile != "default" and profile in config:
+        result.update(config[profile])
+    return result
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="awto serial daemon")
-    ap.add_argument("--port",   default=DEFAULT_PORT,        help="serial device")
-    ap.add_argument("--baud",   default=DEFAULT_BAUD, type=int, help="baud rate")
-    ap.add_argument("--eol",    default=DEFAULT_EOL,
+    ap.add_argument("--profile", default=None, metavar="NAME",
+                    help="load settings from ~/.config/awto-serial/config.toml profile")
+    ap.add_argument("--port",   default=None,        help="serial device")
+    ap.add_argument("--baud",   default=None, type=int, help="baud rate")
+    ap.add_argument("--eol",    default=None,
                     choices=list(EOL_BYTES.keys()),
                     help="line ending used for outgoing query() calls")
-    ap.add_argument("--socket", default=DEFAULT_SOCKET_PATH, help="Unix socket path")
+    ap.add_argument("--socket", default=None, help="Unix socket path")
     ap.add_argument("--log-level", default="INFO",
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    ap.add_argument("--map", default="", metavar="MAPS",
+    ap.add_argument("--map", default=None, metavar="MAPS",
                     help="comma-separated char maps: INLCRNL,ICRNL,ONLCRNL,ODELBS")
     ap.add_argument("--log-file", default=None, metavar="PATH",
                     help="log all RX data to this file (always appended, never deleted)")
@@ -561,18 +895,43 @@ def main() -> None:
                     help="strip ANSI/control chars before writing log lines")
     ap.add_argument("--timestamp", default=None, choices=["iso8601", "24hour", "epoch"],
                     help="prepend timestamp to log lines")
+    ap.add_argument("--history-size", default=None, type=int, metavar="N",
+                    help="RX ring buffer size in lines (default 1000)")
     args = ap.parse_args()
+
+    # --- merge profile defaults → env → CLI args ---
+    profile_cfg: dict = {}
+    if args.profile:
+        profile_cfg = _load_profile(args.profile)
+        log.debug("profile %r: %s", args.profile, profile_cfg)
+
+    def _get(cli_val, profile_key: str, default):
+        if cli_val is not None:
+            return cli_val
+        if profile_key in profile_cfg:
+            return profile_cfg[profile_key]
+        return default
+
+    port         = _get(args.port,         "port",         DEFAULT_PORT)
+    baud         = _get(args.baud,         "baud",         DEFAULT_BAUD)
+    eol          = _get(args.eol,          "line_ending",  DEFAULT_EOL)
+    socket_path  = _get(args.socket,       "socket",       DEFAULT_SOCKET_PATH)
+    map_str      = _get(args.map,          "map",          "")
+    log_file     = _get(args.log_file,     "log_file",     None)
+    log_strip    = args.log_strip or bool(profile_cfg.get("log_strip", False))
+    timestamp    = _get(args.timestamp,    "timestamp",    None)
+    history_size = _get(args.history_size, "history_size", 1000)
 
     _setup_logging("awto-serial-daemon", args.log_level)
 
-    worker = SerialWorker(args.port, args.baud, eol=args.eol)
-    if args.map:
-        worker.set_map(args.map)
-    if args.log_file:
-        worker.set_log_strip(args.log_strip)
-        worker.log_start(args.log_file)
-    if args.timestamp:
-        worker.set_timestamp(args.timestamp)
+    worker = SerialWorker(port, baud, eol=eol, history_size=history_size)
+    if map_str:
+        worker.set_map(map_str)
+    if log_file:
+        worker.set_log_strip(log_strip)
+        worker.log_start(log_file)
+    if timestamp:
+        worker.set_timestamp(timestamp)
     try:
         worker.open()
     except serial.SerialException as exc:
@@ -580,13 +939,13 @@ def main() -> None:
         sys.exit(1)
 
     # remove stale socket
-    if os.path.exists(args.socket):
-        os.unlink(args.socket)
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
 
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(args.socket)
-    os.chmod(args.socket, 0o600)
+    server_sock.bind(socket_path)
+    os.chmod(socket_path, 0o600)
     server_sock.listen(8)
 
     log.info("listening on %s  (ctrl-c to stop)", args.socket)
@@ -605,8 +964,8 @@ def main() -> None:
         log.info("shutting down")
     finally:
         server_sock.close()
-        if os.path.exists(args.socket):
-            os.unlink(args.socket)
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
         worker.close()
 
 
